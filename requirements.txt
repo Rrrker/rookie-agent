@@ -1,0 +1,27 @@
+# ============================================================
+# Codex Agent System — 依赖清单
+# 安装（国内镜像）:
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# ============================================================
+
+# ---- Agent 运行时（主脑）----
+# 官方 Codex Python SDK；自带 pinned CLI runtime，需要 Codex 账号或 API Key
+openai-codex>=0.1.0
+
+# ---- 记忆层 ----
+# 长期记忆：ChromaDB 向量库 + SQLite 时序知识图谱（local-first，零 API Key）
+mempalace>=3.3.0
+chromadb>=0.5.0                 # mempalace 的默认向量后端
+
+# ---- 消息渠道 ----
+python-telegram-bot>=21.6       # Telegram Bot（全异步）
+
+# ---- 工具协议 ----
+mcp>=1.9.0                      # MCP 官方 SDK：既做 client 也做 server
+
+# ---- 多模态模型（OpenAI 兼容端点）----
+openai>=1.40.0                  # vision / stt / tts 客户端
+httpx>=0.27.0
+
+# 注：写 ~/.codex/config.toml 用的是"检查后追加"的纯文本方式，
+# 不修改用户已有配置，因此不需要 toml 库。
