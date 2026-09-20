@@ -1,0 +1,62 @@
+[Unit]
+Description=Codex Agent System (rookie-agent) — 长期记忆型多模态 Agent
+Documentation=https://github.com/Rrrker/rookie-agent
+# 需要网络：Telegram 长轮询 + Codex app-server + 各模态模型端点
+After=network-online.target
+Wants=network-online.target
+
+# 崩溃自愈，但**不允许无限重启**：配置错误会以 exit 2 退出（fail-closed），
+# 没有这个上限就会变成 5 秒一次的无限重启风暴，把 journal 刷满。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_DIR@
+
+# 密钥与运行参数走 EnvironmentFile（install.sh 会把它设为 600 权限）
+EnvironmentFile=@APP_DIR@/.env
+
+# 日志不走缓冲，journalctl 才能实时看到
+Environment=PYTHONUNBUFFERED=1
+# systemd 默认 LANG 为空（POSIX locale）。本项目日志里有大量中文，
+# 不显式指定会在输出中文时抛 UnicodeEncodeError。
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+# MCP 子进程用的解释器必须显式指向本项目的 venv —— 裸 `python` 在 Debian/Ubuntu 上不存在
+Environment=AGENT_MCP_COMMAND=@APP_DIR@/.venv/bin/python
+
+ExecStart=@APP_DIR@/.venv/bin/python @APP_DIR@/main.py --log-level INFO
+
+Restart=always
+RestartSec=5
+
+# ── 优雅停机（这一组是"能不能托管运行"的关键）──────────────────────────
+# systemd 停止服务时发 SIGTERM。main.py 已注册 SIGTERM 处理器，
+# 会依次停掉 MCP 子进程、长驻进程、flush 记忆 outbox 后再退出。
+# TimeoutStopSec 必须大于最慢的那一步，否则会被 SIGKILL 打断，前功尽弃。
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rookie-agent
+
+# ── 沙箱加固：刻意保持克制 ────────────────────────────────────────────
+# 注意这里**没有** NoNewPrivileges=yes，也**没有** ProtectHome=read-only：
+#
+# * Codex 的 Linux 沙箱靠 bubblewrap 创建 unprivileged user namespace，
+#   而 NoNewPrivileges 会切断 bwrap 的权限提升路径。一旦沙箱建不起来，
+#   Codex 会 fail-closed —— 表现为"服务正常、模型收不到任何工具结果"，
+#   极难排查。安全边界由 Codex 自己的沙箱负责，systemd 层不做会与之冲突的加固。
+# * ~/.codex / ~/.mempalace 必须可写；ProtectHome=read-only 会把它们锁死。
+ProtectSystem=full
+PrivateTmp=yes
+ReadWritePaths=@APP_DIR@/var
+# 若把记忆库放在项目内（AGENT_DATA_DIR）而不是 ~/.mempalace，把上面这行换成对应目录即可。
+
+[Install]
+WantedBy=multi-user.target

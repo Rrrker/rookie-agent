@@ -6,7 +6,7 @@
 PAD 情绪 + 多模态路由 + MCP 工具挂载。
 
 六个模块彼此只依赖 `app/contracts.py`，实现类之间互不 import —— 任何一个模块都能被替换成
-Mock。两个离线测试正是靠这一点验证架构：**`smoke_test.py` 32/32**（架构层）、
+Mock。两个离线测试正是靠这一点验证架构：**`smoke_test.py` 33/33**（架构层）、
 **`smoke_exec.py` 65/65**（执行层），全程不需要 MemPalace、Telegram 或 Codex 账号。
 
 ---
@@ -19,7 +19,7 @@ cd rookie-agent
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # ① 离线验证：不装任何外部依赖也能跑通全链路（用桩替换工具/渠道/模型）
-python scripts/smoke_test.py    # 架构层 32/32
+python scripts/smoke_test.py    # 架构层 33/33
 python scripts/smoke_exec.py    # 执行层 65/65
 
 # ② 把识图/STT/TTS/记忆 四个 MCP server 挂载进 Codex（只追加，不重写你的配置）
@@ -457,14 +457,47 @@ env_vars = ["VISION_API_KEY", "STT_API_KEY", "TTS_API_KEY", "VISION_BASE_URL", "
 
 ```bash
 cp .env.example .env       # 填 TELEGRAM_BOT_TOKEN / OPENAI_API_KEY / 各模态端点
+python main.py --health-check        # 装配 + 自检后退出（0=健康 1=不健康 2=配置阻塞）
 python main.py --dry-run --console   # 先验证装配
 python main.py --console             # 终端对话
 python main.py                       # 接 Telegram
 ```
 
-启动参数：`--console`（终端渠道）、`--dry-run`（不调真实模型）、`--log-level DEBUG`。
+启动参数：`--console`（终端渠道）、`--dry-run`（不调真实模型）、`--health-check`（自检后退出）、
+`--log-level DEBUG`。
 
-### 7.5 Codex 登录
+### 7.5 Linux 物理机 / 云主机部署（systemd 托管）
+
+**不要**用 `nohup python main.py &` —— 那样 `systemctl stop` / 重启 / 崩溃自愈全都没有。
+本仓库带一个惰性部署套件：
+
+```bash
+./deploy/install.sh          # 系统依赖 + venv + 目录 + .env + systemd unit（幂等，可重复跑）
+nano .env                    # 填密钥
+./deploy/verify.sh           # 部署验收：含 SIGTERM 优雅停机与孤儿进程检查
+sudo systemctl enable --now rookie-agent
+journalctl -u rookie-agent -f
+```
+
+`deploy/` 里的东西各管一件事：
+
+| 文件 | 作用 |
+| --- | --- |
+| `install.sh` | 一键引导（apt 依赖 → venv → 目录 → `.env` → unit），会拒绝不满足的前提 |
+| `verify.sh` | 验收脚本，专抓"不报错只静默失能"的故障 |
+| `probe_runtime_api.py` | 运行时 API 探针：逐个校验**代码真正调用的外部符号**（34 项），抓"包还在但子模块/参数被删"的静默破坏 |
+| `rookie-agent.service.in` | systemd unit 模板（`install.sh` 负责渲染占位符） |
+| `env.production.example` | 生产环境配置模板（含每项的作用与坑） |
+| `requirements.lock.txt` | 首次成功安装后由 `pip freeze` 生成，下次用它而不是范围约束 |
+
+> ⚠️ **镜像源**：默认走阿里云。**不要用清华源** —— `pypi.tuna.tsinghua.edu.cn`
+> 上不存在 `openai-codex`，会报 `Could not find a version ... (from versions: none)`，
+> 看起来像包不存在，实际是源的问题。`install.sh` 内置了回退到 `pypi.org` 的逻辑。
+
+完整运行手册（路径规划、权限、备份、升级回滚、故障排查）见
+**[`docs/deployment-linux.md`](docs/deployment-linux.md)**。
+
+### 7.6 Codex 登录
 
 `CodexBrain` 自动复用已有 Codex 登录态。首次可：
 
@@ -482,7 +515,7 @@ with Codex() as codex:
 `python scripts/smoke_test.py` —— 用桩替换工具层、渠道层与模型，验证架构与流程本身：
 
 ```
-通过 31/31
+通过 33/33
 
 场景 1｜对话流水线（情绪 + 记忆 + 主脑）
   输入            P       A       D      象限
@@ -526,9 +559,18 @@ rookie-agent/
 ├── scripts/
 │   ├── setup_codex_mcp.py           # 把工具挂载进 ~/.codex/config.toml
 │   ├── probe_sandbox.py             # 沙箱边界探测（不需要 Codex 账号）
-│   ├── smoke_test.py                # 架构冒烟测试（31 项）
+│   ├── smoke_test.py                # 架构冒烟测试（33 项）
 │   └── smoke_exec.py                # 执行层专项测试（65 项）
+├── deploy/                          # Linux 部署套件（无容器化）
+│   ├── install.sh                   # 一键引导：apt 依赖 → venv → 目录 → .env → unit
+│   ├── verify.sh                    # 部署验收：含 SIGTERM 优雅停机与孤儿进程检查
+│   ├── probe_runtime_api.py         # 运行时 API 探针（34 项，抓"包在但 API 变了"）
+│   ├── rookie-agent.service.in      # systemd unit 模板
+│   ├── env.production.example       # 生产环境配置模板
+│   └── requirements.lock.txt        # 首次安装后由 pip freeze 生成（版本锁）
 ├── docs/
+│   ├── deployment-linux.md          # ★ Linux 部署运行手册（路径/权限/备份/排障）
+│   ├── linux-deployment-readiness.md # v0.1.0 Linux 上线可行性评估
 │   ├── shell-tool-design.md         # 终端执行能力设计方案（含已核实的 SDK 事实）
 │   └── (sandbox-probe-report.md)    # 本机生成、不入库：含绝对路径与平台安全画像
 ├── requirements.txt
@@ -627,6 +669,6 @@ Codex 只有一次性命令，没有 Hermes 的 `process`（start/logs/kill）�
 ### 11.5 验证
 
 ```bash
-python scripts/smoke_test.py    # 架构层 31/31
+python scripts/smoke_test.py    # 架构层 33/33
 python scripts/smoke_exec.py    # 执行层 65/65（含真实进程 start/logs/stop 全链路）
 ```
