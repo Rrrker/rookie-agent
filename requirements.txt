@@ -1,27 +1,56 @@
 # ============================================================
 # Codex Agent System — 依赖清单
-# 安装（国内镜像）:
-#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 安装（国内镜像，推荐阿里云）:
+#   pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple
+#
+# ⚠ 不要用清华镜像装本清单：pypi.tuna.tsinghua.edu.cn 上**没有** openai-codex
+#   （/simple/openai-codex/ 返回 404），pip 会报 "from versions: none"。
+#   这不是网络问题，换源才能解决。deploy/install.sh 已内置该回退逻辑。
+#
+# 版本策略：本清单在 v0.1.0 起改为**带上限的区间约束**。
+# 原因见每条注释 —— 这几条上限都是踩过的坑，不是形式主义。
 # ============================================================
 
 # ---- Agent 运行时（主脑）----
-# 官方 Codex Python SDK；自带 pinned CLI runtime，需要 Codex 账号或 API Key
-openai-codex>=0.1.0
+# 官方 Codex Python SDK，自带 pinned CLI runtime（openai-codex-cli-bin）。
+#
+# 为什么精确锁 ==：该 SDK 处于 beta，API 面随版本变化（本项目用到的
+# AsyncCodex / Sandbox / ApprovalMode 都是它的公开面）。且它**硬 pin**
+# 了同版本的 cli-bin，跨版本会同时换掉 CLI 二进制，回归面太大。
+# 0.154.0 是本地已验证版本，且阿里云镜像已同步（0.155.1 仅 pypi.org 有）。
+openai-codex==0.154.0
 
 # ---- 记忆层 ----
 # 长期记忆：ChromaDB 向量库 + SQLite 时序知识图谱（local-first，零 API Key）
-mempalace>=3.3.0
-chromadb>=0.5.0                 # mempalace 的默认向量后端
+mempalace>=3.3.0,<4
+#
+# 🔴 chromadb 必须 <2：它是 mempalace 的默认向量后端。
+# 0.5 → 1.5 是**包结构级**重构，1.x 起把 onnxruntime 变成硬依赖
+# （首次安装要多下 ~50MB 且依赖 cp 版本专属 wheel）。上限留到 2 是为了
+# 在 chromadb 下一次大重构时强制人工复核，而不是被 pip 静默带走。
+chromadb>=0.5.0,<2
 
 # ---- 消息渠道 ----
-python-telegram-bot>=21.6       # Telegram Bot（全异步）
+# Telegram Bot（全异步）。21.6 → 22.8 是项目内已验证的 API 面
+# （Application / MessageHandler / filters / ChatAction）。
+python-telegram-bot>=21.6,<23
 
 # ---- 工具协议 ----
-mcp>=1.9.0                      # MCP 官方 SDK：既做 client 也做 server
+# 🔴 mcp 必须 <2：mcp 2.x **删除了** mcp.server.fastmcp。
+# 2.x 里 mcp/server/fastmcp.py 只剩一个 raise ModuleNotFoundError 的桩，
+# 官方提示是"FastMCP 已改名为 MCPServer，或 pin mcp<2 以继续跑 v1 代码"。
+# 本项目 mcp_servers/media_tools_server.py 是模块级 import，
+# 一旦装到 2.x，该 server 会在启动瞬间就崩，且没有任何降级路径。
+mcp>=1.9.0,<2
 
 # ---- 多模态模型（OpenAI 兼容端点）----
-openai>=1.40.0                  # vision / stt / tts 客户端
-httpx>=0.27.0
+# vision / stt / tts 客户端。已核对 3.16.2 的
+# audio.speech.create / audio.transcriptions.create / chat.completions
+# 参数与代码用法一致（含 response_format / instructions / speed）。
+# 上限 4 只是拦住未来的下一个大版本，1.x~3.x 均可。
+openai>=1.40.0,<4
+httpx>=0.27.0,<1
 
 # 注：写 ~/.codex/config.toml 用的是"检查后追加"的纯文本方式，
 # 不修改用户已有配置，因此不需要 toml 库。

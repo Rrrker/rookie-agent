@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,6 +70,40 @@ def _home_mempalace(*parts: str) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+# 路径锚点 —— 为什么不能让路径跟着 CWD 走
+# --------------------------------------------------------------------------- #
+
+
+def project_root() -> Path:
+    """项目根目录：以本文件位置为锚点，而不是当前工作目录。
+
+    这一条是**部署刚需**，不是洁癖：
+
+    * systemd 默认把服务的工作目录设为 ``/``。此时 ``./var`` 会被解析成 ``/var``，
+      非 root 服务账号直接 ``PermissionError: [Errno 13]``，**启动即失败**；
+    * 若以 root 运行，则把运行数据（记忆 outbox、会话库、附件）写进系统 ``/var``，
+      比启动失败更糟；
+    * ``.env`` 同理：读不到时会**静默回落到全部默认配置**，比报错更难排查。
+
+    用 ``__file__`` 锚定后，无论从哪个目录、以什么方式启动，行为都一致。
+    """
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_from_root(path: Path | str, *, root: Path | None = None) -> Path:
+    """把路径统一解析成绝对路径；相对值以**项目根**为基准（不是 CWD）。"""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = (root or project_root()) / p
+    return p.resolve()
+
+
+def _default_data_dir() -> Path:
+    """运行数据根目录的兜底默认值：``<项目根>/var``。"""
+    return project_root() / "var"
+
+
+# --------------------------------------------------------------------------- #
 # 分模块配置
 # --------------------------------------------------------------------------- #
 
@@ -79,7 +115,8 @@ class CodexConfig:
     model: str = "gpt-5.6-terra"
     sandbox: str = "read_only"  # read_only | workspace_write | full_access
     api_key: str | None = None
-    working_dir: Path = field(default_factory=Path.cwd)
+    # 主脑的工作目录（agent 的"工作区"）。默认锚定项目根而非 CWD —— 见 project_root()。
+    working_dir: Path = field(default_factory=project_root)
     # 审批模式。**已用内省实测**：SDK 的 ApprovalMode 只有两个成员 ——
     # `auto_review`（默认，交给自动审查器裁决）与 `deny_all`（一律拒绝）。
     # 不存在 CLI 侧的 never / untrusted / on_request 这些名字，不要照搬文档。
@@ -98,7 +135,7 @@ class CodexConfig:
 class TelegramConfig:
     token: str | None = None
     allowed_chat_ids: frozenset[str] = frozenset()
-    media_dir: Path = field(default_factory=lambda: Path("./var/media"))
+    media_dir: Path = field(default_factory=lambda: _default_data_dir() / "media")
     # Telegram 单条消息上限 4096 字符，留一点余量做分片
     max_message_chars: int = 3800
 
@@ -124,8 +161,19 @@ class MemoryConfig:
     persist_turns: bool = True
     # 是否用 Codex 抽取实体/关系三元组写进知识图谱（多一次模型调用，默认关）
     extract_facts: bool = False
-    # MCP server 启动命令；留空则不启用 MCP 写入通道
-    mcp_command: str = "python"
+    # MCP 写入失败时的补投队列。归到配置里而不是硬编码在 memory 模块 ——
+    # 否则 AGENT_DATA_DIR 改了它却不动，outbox 会散落在 CWD 下（部署时的经典坑）。
+    outbox_path: Path = field(
+        default_factory=lambda: _default_data_dir() / "memory_outbox.jsonl"
+    )
+    # MCP server 启动命令。
+    #
+    # ⚠️ 默认值必须是**当前解释器的绝对路径**，不能是裸 ``"python"``：
+    # Debian / Ubuntu 遵循 PEP 394 只提供 ``python3``，裸 ``python`` 常常不存在，
+    # 结果是两个 MCP server 全部起不来 —— 而 hub 把子进程启动失败降级成一条 warning，
+    # 于是系统"看起来启动成功、工具数却是 0"，识图/STT/TTS/记忆集体失能。
+    # 用 sys.executable 还顺带保证子进程跑在同一个 venv 里。
+    mcp_command: str = field(default_factory=lambda: sys.executable)
     mcp_args: tuple[str, ...] = ("-m", "mempalace.mcp_server")
 
 
@@ -147,10 +195,10 @@ class MediaConfig:
     tts_voice: str = "alloy"
 
     ffmpeg_bin: str = "ffmpeg"
-    media_dir: Path = field(default_factory=lambda: Path("./var/media"))
+    media_dir: Path = field(default_factory=lambda: _default_data_dir() / "media")
 
-    # MCP server 启动命令（自建 media-tools server）
-    mcp_command: str = "python"
+    # MCP server 启动命令（自建 media-tools server）。理由同 MemoryConfig.mcp_command。
+    mcp_command: str = field(default_factory=lambda: sys.executable)
     mcp_args: tuple[str, ...] = ("-m", "mcp_servers.media_tools_server")
 
 
@@ -190,7 +238,7 @@ class SchedulerConfig:
     clone_timeout_sec: float = 600.0
     max_queue_size: int = 64
     # 分身工作目录根：每个分身会拿到独立子目录，实现沙箱隔离
-    clone_root: Path = field(default_factory=lambda: Path("./var/clones"))
+    clone_root: Path = field(default_factory=lambda: _default_data_dir() / "clones")
     # 失败任务重试次数
     max_retries: int = 1
 
@@ -206,7 +254,7 @@ class ExecConfig:
 
     enabled: bool = True
     # 白名单命令的默认工作目录
-    workdir: Path = field(default_factory=lambda: Path("./var/exec"))
+    workdir: Path = field(default_factory=lambda: _default_data_dir() / "exec")
     timeout_sec: float = 60.0
     # 返回级截断（给人/日志看）
     max_output_chars: int = 4000
@@ -230,7 +278,7 @@ class ProcessConfig:
     """
 
     enabled: bool = False
-    workdir: Path = field(default_factory=lambda: Path("./var/procs"))
+    workdir: Path = field(default_factory=lambda: _default_data_dir() / "procs")
     max_processes: int = 3
     grace_sec: float = 5.0
     # 每个进程日志环形缓冲的字节上限，防止跑一周把内存吃穿
@@ -254,16 +302,26 @@ class AppConfig:
 
 
 def load_config(env_file: Path | str = ".env") -> AppConfig:
-    """从 .env / 环境变量组装 AppConfig。"""
-    load_dotenv(env_file)
+    """从 .env / 环境变量组装 AppConfig。
 
-    data_dir = Path(env("AGENT_DATA_DIR", "./var") or "./var")
+    路径解析约定（部署相关，别改回去）：
+
+    * ``env_file`` 是相对路径时，以**项目根**为基准解析，而不是 CWD；
+    * ``AGENT_DATA_DIR`` 同理，默认 ``<项目根>/var``；
+    * 其余所有 ``*_WORKDIR`` / ``*_PATH`` 相对值也一律以项目根为基准。
+
+    这样 systemd（CWD=``/``）与手动前台运行（CWD=项目根）得到完全一致的配置。
+    """
+    root = project_root()
+    load_dotenv(resolve_from_root(env_file, root=root))
+
+    data_dir = resolve_from_root(env("AGENT_DATA_DIR") or "var", root=root)
 
     codex = CodexConfig(
         model=env("AGENT_CODEX_MODEL", "gpt-5.6-terra") or "gpt-5.6-terra",
         sandbox=env("AGENT_CODEX_SANDBOX", "read_only") or "read_only",
         api_key=env("OPENAI_API_KEY"),
-        working_dir=Path(env("AGENT_CODEX_CWD", str(Path.cwd())) or str(Path.cwd())),
+        working_dir=resolve_from_root(env("AGENT_CODEX_CWD") or ".", root=root),
         approval_mode=env("AGENT_CODEX_APPROVAL_MODE", "deny_all") or "deny_all",
         turn_timeout_sec=env_float("AGENT_TURN_TIMEOUT_SEC", 180.0),
         dry_run=env_bool("AGENT_DRY_RUN", False),
@@ -275,15 +333,25 @@ def load_config(env_file: Path | str = ".env") -> AppConfig:
         media_dir=data_dir / "media",
     )
 
+    # MCP 解释器：默认当前解释器（见 MemoryConfig.mcp_command 的说明），
+    # 允许用 AGENT_MCP_COMMAND 覆盖成虚拟环境的绝对路径。
+    mcp_command = env("AGENT_MCP_COMMAND") or sys.executable
+
     memory = MemoryConfig(
-        palace_path=Path(env("MEMPALACE_PALACE_PATH", str(_home_mempalace("palace")))),
-        kg_path=Path(env("MEMPALACE_KG_PATH", str(_home_mempalace("knowledge_graph.sqlite3")))),
+        palace_path=resolve_from_root(
+            env("MEMPALACE_PALACE_PATH") or _home_mempalace("palace"), root=root
+        ),
+        kg_path=resolve_from_root(
+            env("MEMPALACE_KG_PATH") or _home_mempalace("knowledge_graph.sqlite3"), root=root
+        ),
         collection_name=env("MEMPALACE_COLLECTION", "mempalace_drawers") or "mempalace_drawers",
         default_wing=env("AGENT_WING", "wing_agent") or "wing_agent",
         default_room=env("AGENT_ROOM_DEFAULT", "conversation") or "conversation",
         recall_topk=env_int("AGENT_MEMORY_TOPK", 5),
         persist_turns=env_bool("AGENT_PERSIST_TURNS", True),
         extract_facts=env_bool("AGENT_EXTRACT_FACTS", False),
+        outbox_path=data_dir / "memory_outbox.jsonl",
+        mcp_command=mcp_command,
     )
 
     media = MediaConfig(
@@ -299,6 +367,7 @@ def load_config(env_file: Path | str = ".env") -> AppConfig:
         tts_voice=env("TTS_VOICE", "alloy") or "alloy",
         ffmpeg_bin=env("FFMPEG_BIN", "ffmpeg") or "ffmpeg",
         media_dir=data_dir / "media",
+        mcp_command=mcp_command,
     )
 
     emotion = EmotionConfig(
@@ -321,7 +390,9 @@ def load_config(env_file: Path | str = ".env") -> AppConfig:
 
     exec_cfg = ExecConfig(
         enabled=env_bool("AGENT_EXEC_ENABLED", True),
-        workdir=Path(env("AGENT_EXEC_WORKDIR", str(data_dir / "exec"))),
+        workdir=resolve_from_root(
+            env("AGENT_EXEC_WORKDIR") or (data_dir / "exec"), root=root
+        ),
         timeout_sec=env_float("AGENT_EXEC_TIMEOUT_SEC", 60.0),
         max_output_chars=env_int("AGENT_EXEC_MAX_OUTPUT_CHARS", 4000),
         max_capture_bytes=env_int("AGENT_EXEC_MAX_CAPTURE_BYTES", 131072),
@@ -332,7 +403,9 @@ def load_config(env_file: Path | str = ".env") -> AppConfig:
 
     process_cfg = ProcessConfig(
         enabled=env_bool("AGENT_PROCESS_ENABLED", False),
-        workdir=Path(env("AGENT_PROCESS_WORKDIR", str(data_dir / "procs"))),
+        workdir=resolve_from_root(
+            env("AGENT_PROCESS_WORKDIR") or (data_dir / "procs"), root=root
+        ),
         max_processes=env_int("AGENT_PROCESS_MAX", 3),
         grace_sec=env_float("AGENT_PROCESS_GRACE_SEC", 5.0),
         max_log_bytes=env_int("AGENT_PROCESS_MAX_LOG_BYTES", 262144),
@@ -381,6 +454,83 @@ def validate_security(cfg: AppConfig) -> tuple[list[str], list[str]]:
         notices.append(
             "AGENT_CODEX_SANDBOX=full_access：Codex 无文件系统限制，"
             "仅应在一次性环境（容器 / 全新虚拟机）中使用。"
+        )
+
+    return problems, notices
+
+
+def _executable_exists(cmd: str) -> bool:
+    """判断 MCP 启动命令是否可用：绝对/带分隔符的查文件，裸名字查 PATH。"""
+    if not cmd:
+        return False
+    if Path(cmd).is_absolute() or "/" in cmd or "\\" in cmd:
+        return Path(cmd).exists()
+    return shutil.which(cmd) is not None
+
+
+def validate_environment(cfg: AppConfig) -> tuple[list[str], list[str]]:
+    """部署环境自检，返回 ``(阻塞性问题, 仅提醒的注意项)``。
+
+    与 :func:`validate_security` 的分工：那个管"配置是否安全"，这个管"环境是否能跑"。
+    两者都是 fail-fast 同一目的：把"启动到一半才炸"的问题提前到启动前 ——
+    尤其是那类**不会报错、只是静默失能**的失败（MCP 工具数为 0、沙箱 fail-closed），
+    它们在日志里往往只有一行 warning，排查成本极高。
+    """
+    problems: list[str] = []
+    notices: list[str] = []
+
+    # 1) 数据目录必须可写 —— systemd 下最常见的失败点（路径相对 CWD）
+    try:
+        cfg.data_dir.mkdir(parents=True, exist_ok=True)
+        probe = cfg.data_dir / ".write_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        problems.append(
+            f"数据目录不可写：{cfg.data_dir}（{exc}）。"
+            "请确认目录存在、属主是运行服务的用户；或把 AGENT_DATA_DIR 指到别处。"
+        )
+
+    # 2) MCP 解释器必须存在 —— 裸 "python" 在 Debian/Ubuntu 上不存在，会导致"启动成功但零工具"
+    for label, cmd in (
+        ("记忆 MCP (mempalace)", cfg.memory.mcp_command),
+        ("多模态 MCP (media_tools)", cfg.media.mcp_command),
+    ):
+        if not _executable_exists(cmd):
+            problems.append(
+                f"{label} 的解释器不存在：{cmd!r}。"
+                "请把 AGENT_MCP_COMMAND 设为虚拟环境里 python 的绝对路径。"
+            )
+
+    # 3) 记忆库路径的父目录要能创建
+    for label, path in (("记忆宫殿 palace", cfg.memory.palace_path), ("知识图谱", cfg.memory.kg_path)):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            problems.append(f"{label} 的父目录不可创建：{path.parent}（{exc}）")
+
+    # 4) Linux 沙箱依赖：bwrap 缺失时 Codex 会 fail-closed（agent 活着但不干活）
+    if sys.platform.startswith("linux"):
+        if shutil.which("bwrap"):
+            notices.append("bubblewrap(bwrap) 就绪：Codex 的 Linux 沙箱可正常工作。")
+        else:
+            notices.append(
+                "PATH 上未找到 bwrap。Codex 会回退到自带 bwrap；"
+                "但若运行环境禁止 unprivileged user namespace（典型：未加权限的容器），"
+                "沙箱会 fail-closed —— agent 将无法执行任何工具调用。建议 apt install bubblewrap。"
+            )
+
+    # 5) ffmpeg 可选：缺失时 TTS 降级为发送音频文件（不是语音气泡）
+    if not shutil.which(cfg.media.ffmpeg_bin):
+        notices.append(
+            f"未找到 {cfg.media.ffmpeg_bin}：语音回复会降级为 mp3 音频文件而不是语音气泡（功能不中断）。"
+        )
+
+    # 6) 长驻进程只写了 systemd unit 的假设，这里只提醒，不阻塞
+    if cfg.process.enabled and not sys.platform.startswith("linux"):
+        notices.append(
+            "AGENT_PROCESS_ENABLED=true 但当前不是 Linux："
+            "长驻进程不受任何沙箱约束，请确保运行在专用账号下。"
         )
 
     return problems, notices

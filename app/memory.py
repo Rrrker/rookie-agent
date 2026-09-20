@@ -202,7 +202,9 @@ class MemoryGateway:
         self._searcher = _maybe_import("mempalace.searcher")
         self._layers = _maybe_import("mempalace.layers")
         self._fallback = _SqliteKgReader(cfg.kg_path)
-        self._outbox = Path("./var/memory_outbox.jsonl")
+        # outbox 路径取自配置，不硬编码 —— 硬编码的 "./var/..." 会跟着 CWD 跑，
+        # systemd（CWD=/）下会写进系统 /var，且 AGENT_DATA_DIR 改了它也不动。
+        self._outbox = cfg.outbox_path
         self._kg_lock = asyncio.Lock()  # SQLite 写串行化，避免 database is locked
         self._kg_handle: Any | None = None
         self._stack_handle: Any | None = None

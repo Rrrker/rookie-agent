@@ -81,3 +81,24 @@ class ConsoleChannel:
     async def send_typing(self, chat_id: str, *, action: str = "typing") -> None:
         sys.stdout.write("…")
         sys.stdout.flush()
+
+
+class NullChannel:
+    """什么都不做的渠道 —— 第三个 ChannelPort 实现。
+
+    用途单一但明确：**让系统在没有渠道的情况下也能被完整装配起来**。
+    目前最大的消费方是 ``python main.py --health-check``：运维/CI 要验证的是
+    "记忆层、工具枢纽、主脑、分身调度能不能起来"，而不是"Telegram 能不能收消息"。
+    用 NullChannel 就不需要 Telegram token，也不会有 stdin 读取任务挂在那里。
+
+    顺带再证一次端口抽象成立：加第三个渠道，上面五层一行都没改。
+    """
+
+    name = "null"
+
+    async def start(self, handler: InboundHandler) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def send(self, out: OutboundMessage) -> None: ...
+

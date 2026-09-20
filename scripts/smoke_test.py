@@ -393,7 +393,14 @@ async def scenario_memory(hub: FakeHub, orch: Orchestrator) -> None:
     )
     hub.fail_writes = False
     check("写入失败时落 outbox", record_id.startswith("outbox_"), record_id)
-    outbox = Path("./var/memory_outbox.jsonl")
+    # outbox 路径必须**由配置派生**，不能硬编码 "./var/..." ——
+    # 硬编码的路径会跟着 CWD 跑，systemd（CWD=/）下会写进系统 /var。
+    outbox = orch.memory._outbox  # noqa: SLF001 - 内省：这一项验证的就是"路径来源"
+    check(
+        "outbox 落在 AGENT_DATA_DIR 下（不跟随 CWD）",
+        orch.cfg.data_dir in outbox.parents,
+        str(outbox),
+    )
     check("outbox 文件已生成", outbox.exists(), f"{outbox.stat().st_size if outbox.exists() else 0} 字节")
     flushed = await orch.memory.flush_outbox()
     check("outbox 可补投", flushed >= 1, f"补投 {flushed} 条")
@@ -510,7 +517,14 @@ async def run() -> int:
         cfg,
         codex=replace(cfg.codex, dry_run=True),
         data_dir=workdir,
-        memory=replace(cfg.memory, persist_turns=True, extract_facts=False),
+        # 注意：outbox_path 与 media_dir 都是 load_config 时从 data_dir 派生的，
+        # 所以替换 data_dir 后必须**一并替换**它们，否则会写到真实数据目录去。
+        memory=replace(
+            cfg.memory,
+            persist_turns=True,
+            extract_facts=False,
+            outbox_path=workdir / "memory_outbox.jsonl",
+        ),
         media=replace(cfg.media, media_dir=workdir / "media"),
     )
 

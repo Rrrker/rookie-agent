@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from app.command_audit import extract_commands, extract_file_changes
-from app.config import CodexConfig
+from app.config import CodexConfig, project_root
 from app.contracts import CloneSpec, CommandTrace, Entity, ExtractionResult, Triple, ToolPort
 
 logger = logging.getLogger(__name__)
@@ -243,7 +243,10 @@ class CodexBrain:
         self._codex: Any | None = None
         self._threads: dict[str, Any] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        self._store = _SessionStore(session_db or Path("./var/sessions.sqlite3"))
+        # 兜底路径同样锚定项目根而不是 CWD —— 见 config.project_root()。
+        self._store = _SessionStore(
+            session_db or (project_root() / "var" / "sessions.sqlite3")
+        )
 
     # ------------------------------------------------------------------ #
     # 生命周期

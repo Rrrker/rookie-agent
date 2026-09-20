@@ -10,6 +10,7 @@
     python main.py                    # 使用 .env 配置启动
     python main.py --console          # 用终端代替 Telegram（无需 token）
     python main.py --dry-run          # 不调用真实模型，验证装配与流程
+    python main.py --health-check     # 装配 + 自检后退出（0=健康，1=不健康，2=配置阻塞）
     python main.py --allow-insecure   # 显式跳过安全检查（仅开发用）
     python main.py --log-level DEBUG
 """
@@ -18,14 +19,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
+from app import __version__ as AGENT_VERSION
 from app.brain import CodexBrain
 from app.clones import CloneSystem
 from app.command_audit import CommandAuditor
-from app.config import AppConfig, load_config, validate_security
+from app.config import (
+    AppConfig,
+    load_config,
+    validate_environment,
+    validate_security,
+)
 from app.emotion import PadEmotionEngine
 from app.local_exec import LocalExecutor
 from app.mcp_hub import McpHub
@@ -61,8 +71,13 @@ def build_channel(cfg: AppConfig, *, force_console: bool) -> object:
     return TelegramChannel(cfg.telegram)
 
 
-def build_orchestrator(cfg: AppConfig, *, force_console: bool = False) -> Orchestrator:
-    """组装整个系统。顺序体现依赖方向：底层先建，上层后建。"""
+def build_orchestrator(
+    cfg: AppConfig, *, force_console: bool = False, channel: object | None = None
+) -> Orchestrator:
+    """组装整个系统。顺序体现依赖方向：底层先建，上层后建。
+
+    ``channel`` 显式传入时优先使用（健康检查用 NullChannel，不碰 Telegram / stdin）。
+    """
     # 1) 工具层最先建 —— 它没有依赖，且被多层消费
     hub = McpHub.from_app_config(cfg.memory, cfg.media)
 
@@ -91,7 +106,8 @@ def build_orchestrator(cfg: AppConfig, *, force_console: bool = False) -> Orches
     auditor = CommandAuditor(memory, cfg.exec, wing=cfg.memory.default_wing)
 
     # 8) 渠道、编排
-    channel = build_channel(cfg, force_console=force_console)
+    if channel is None:
+        channel = build_channel(cfg, force_console=force_console)
     return Orchestrator(
         cfg,
         channel=channel,
@@ -107,44 +123,148 @@ def build_orchestrator(cfg: AppConfig, *, force_console: bool = False) -> Orches
     )
 
 
+def _preflight(cfg: AppConfig, *, allow_insecure: bool) -> int:
+    """启动前两道闸门：安全校验 + 环境自检。返回 0 = 放行，2 = 拒绝启动。
+
+    顺序刻意放在**装配之前**：fail-closed 的意义就是"别等到启动到一半才发现问题"。
+    """
+    problems: list[str] = []
+    notices: list[str] = []
+
+    sec_problems, sec_notices = validate_security(cfg)
+    env_problems, env_notices = validate_environment(cfg)
+    problems += sec_problems + env_problems
+    notices += sec_notices + env_notices
+
+    for notice in notices:
+        logger.warning("提示：%s", notice)
+    if not problems:
+        return 0
+
+    for problem in problems:
+        logger.error("启动前检查未通过：%s", problem)
+    if allow_insecure:
+        logger.warning("--allow-insecure 已指定，继续启动。风险自负。")
+        return 0
+    logger.error(
+        "已拒绝启动（fail-closed）。修正配置后重试；"
+        "确实要绕过请显式加 --allow-insecure（仅限开发环境）。"
+    )
+    return 2
+
+
 async def amain(args: argparse.Namespace) -> int:
     cfg = load_config(args.env_file)
     if args.dry_run:
         cfg = _with_dry_run(cfg)
+
+    if (code := _preflight(cfg, allow_insecure=args.allow_insecure)) != 0:
+        return code
+
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
-
-    # 安全检查要在"装配之前"做：fail-closed，别等启动到一半才发现配置放开了执行能力
-    problems, notices = validate_security(cfg)
-    for notice in notices:
-        logger.warning("安全提示：%s", notice)
-    if problems:
-        for problem in problems:
-            logger.error("安全检查未通过：%s", problem)
-        if not args.allow_insecure:
-            logger.error(
-                "已拒绝启动（fail-closed）。修正配置后重试；"
-                "确实要绕过请显式加 --allow-insecure（仅限开发环境）。"
-            )
-            return 2
-        logger.warning("--allow-insecure 已指定，继续启动。风险自负。")
-
     orchestrator = build_orchestrator(cfg, force_console=args.console)
 
     try:
         await orchestrator.start()
     except Exception:
         logger.exception("启动失败")
+        with contextlib.suppress(Exception):
+            await orchestrator.stop()
         return 1
 
-    logger.info("系统已启动。按 Ctrl+C 退出。")
+    # ── 优雅停机 ──────────────────────────────────────────────────────────
+    # 这段不是可有可无的收尾代码：`systemctl stop` / `docker stop` 发的是
+    # **SIGTERM**，而 Python 默认只把 SIGINT（Ctrl+C）转成 KeyboardInterrupt。
+    # 不注册 SIGTERM 处理器，进程会被直接杀掉，finally 里的 orchestrator.stop()
+    # 根本不执行 —— 后果是 MCP 子进程与长驻进程变孤儿、outbox 不补投、
+    # SQLite 连接不关闭。这是"跑得起来但停不干净"的典型故障。
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        # Windows 的 ProactorEventLoop 不支持 add_signal_handler（NotImplementedError），
+        # 那里继续走 KeyboardInterrupt 路径即可。
+        with contextlib.suppress(NotImplementedError, ValueError, RuntimeError, AttributeError):
+            loop.add_signal_handler(sig, stop.set)
+
+    logger.info("系统已启动。Ctrl+C 或 SIGTERM 退出（systemd: systemctl stop rookie-agent）。")
     try:
-        await asyncio.Event().wait()
+        await stop.wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        logger.info("正在关闭…")
+        logger.info("收到停止信号，正在优雅关闭…")
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, ValueError, RuntimeError, AttributeError):
+                loop.remove_signal_handler(sig)
         await orchestrator.stop()
+        logger.info("已关闭。")
     return 0
+
+
+async def health_check(args: argparse.Namespace) -> int:
+    """装配整套系统、打印健康报告、退出。**不需要 Telegram token，也不占端口。**
+
+    存在的理由：这是"能部署"和"部署成功"之间的那道闸门。它专门用来抓两类
+    **不会报错、只是静默失能**的故障：
+
+    * MCP 工具数为 0 —— 解释器路径写错时，"服务起来了、但识图/STT/TTS/记忆全废"；
+    * 子进程存活但工具不可用（沙箱 fail-closed）。
+
+    退出码：``0`` 健康 / ``1`` 不健康 / ``2`` 配置或环境有阻塞问题。
+    """
+    cfg = load_config(args.env_file)
+    if args.dry_run:
+        cfg = _with_dry_run(cfg)
+
+    if (code := _preflight(cfg, allow_insecure=args.allow_insecure)) != 0:
+        return code
+
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+
+    from app.channel_console import NullChannel
+
+    orchestrator = build_orchestrator(cfg, channel=NullChannel())
+    try:
+        await orchestrator.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("装配或启动失败：%s", exc, exc_info=True)
+        with contextlib.suppress(Exception):
+            await orchestrator.stop()
+        return 1
+
+    hub_health = orchestrator.hub.health()
+    report = {
+        "version": AGENT_VERSION,
+        "data_dir": str(cfg.data_dir),
+        "python": sys.executable,
+        "codex": orchestrator.brain.health(),
+        "tools": hub_health,
+        "memory": orchestrator.memory.backend_report(),
+        "clones": orchestrator.clones.stats(),
+        "exec": {
+            "internal_commands_enabled": cfg.exec.enabled,
+            "whitelist": orchestrator.executor.names() if orchestrator.executor else [],
+            "processes_enabled": cfg.process.enabled,
+            "audit_enabled": bool(orchestrator.auditor and orchestrator.auditor.enabled),
+        },
+    }
+    await orchestrator.stop()
+
+    print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+
+    tool_count = int(hub_health.get("tool_count") or 0)
+    healthy = sum(1 for s in (hub_health.get("servers") or {}).values() if s.get("healthy"))
+    if tool_count > 0 and healthy > 0:
+        logger.info("健康检查通过：%d 个 MCP server 在线，共 %d 个工具。", healthy, tool_count)
+        print(f"\n[OK] 健康检查通过：{healthy} 个 MCP server 在线，共 {tool_count} 个工具。")
+        return 0
+    logger.error("健康检查未通过：没有任何 MCP 工具挂载（tool_count=%d）。", tool_count)
+    print(
+        f"\n[FAIL] 健康检查未通过：tool_count={tool_count}，healthy_servers={healthy}。\n"
+        "请检查上面 tools.servers 里的 error 字段（常见原因：AGENT_MCP_COMMAND 指向的解释器不存在，"
+        "或 mempalace / mcp 依赖未安装）。"
+    )
+    return 1
 
 
 def _with_dry_run(cfg: AppConfig) -> AppConfig:
@@ -158,8 +278,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Codex Agent System")
     parser.add_argument("--console", action="store_true", help="用终端渠道代替 Telegram")
     parser.add_argument("--dry-run", action="store_true", help="不调用真实模型")
-    parser.add_argument("--env-file", default=".env", help="配置文件路径")
+    parser.add_argument("--env-file", default=".env", help="配置文件路径（相对路径以项目根为基准）")
     parser.add_argument("--log-level", default=None, help="覆盖 AGENT_LOG_LEVEL")
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="装配并自检后退出：0=健康，1=不健康，2=配置/环境阻塞（不需要 Telegram token）",
+    )
     parser.add_argument(
         "--allow-insecure",
         action="store_true",
@@ -173,7 +298,8 @@ def main() -> int:
     cfg = load_config(args.env_file)
     configure_logging(args.log_level or cfg.log_level)
     try:
-        return asyncio.run(amain(args))
+        runner = health_check if args.health_check else amain
+        return asyncio.run(runner(args))
     except KeyboardInterrupt:
         return 130
 
