@@ -185,7 +185,68 @@ curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"id":[0-9-]*
   先在**服务运行账号**下执行一次 `codex login`。
   ⚠️ `~/.codex/auth.json` 必须属于服务账号（`n100`），否则读不到。
 
-### 5.4 建议保持默认的关键项
+### 5.4 自定义 Codex 端点（可选）
+
+默认走官方 `openai` provider。想换成自建网关、公司中转或本地推理服务，填这三项：
+
+```bash
+AGENT_CODEX_BASE_URL=https://your-endpoint.example.com/v1
+AGENT_CODEX_BASE_URL_API_KEY=...      # 留空则复用 OPENAI_API_KEY
+AGENT_CODEX_MODEL=<该端点认识的模型名>  # 默认的 gpt-5.6-terra 它多半不认识
+```
+
+> 🔴 **硬约束：端点必须实现 OpenAI 的 Responses API，且支持 SSE 流式。**
+>
+> 请求会打到 `{AGENT_CODEX_BASE_URL}/responses`，请求头带 `accept: text/event-stream`。
+> Codex CLI 0.154.0 已经把 **Chat Completions 协议整个移除**（实测）：
+>
+> | `wire_api` 取值 | 结果 |
+> | --- | --- |
+> | `"chat"` | `` `wire_api = "chat"` is no longer supported. How to fix: set `wire_api = "responses"` `` |
+> | `"chat_completions"` | `unknown variant, expected 'responses'` |
+> | `"responses"` / 缺省 | 实际请求 `{base_url}/responses` |
+>
+> 所以**只提供 `/v1/chat/completions` 的第三方中转配了也用不了**，哪怕它自称"OpenAI 兼容"。
+> 这是选端点时最容易踩的坑 —— 配置能过、服务能起，只是每轮对话都失败。
+>
+> **先验再配**：
+>
+> ```bash
+> cd /opt/rookie-agent
+> .venv/bin/python scripts/probe_codex_endpoint.py --show-events
+> ```
+>
+> 它实际发一个最小请求，按响应形态给出诊断（404 = 没有 /responses 路径、
+> Content-Type 不是 `text/event-stream` = 不支持流式、401/403 = 密钥问题）。
+> 退出码 0 = 可用 / 1 = 有问题 / 2 = 没配自定义端点。
+
+**生效机制**（排障时会用到）：端点**不在 SDK 层配** ——
+`openai_codex.CodexConfig` 里根本没有 `base_url` 字段。它属于 Codex CLI 的
+`model_providers` 配置，本项目通过 SDK 的 `config_overrides`
+（每个元素拼成 `codex --config k=v`）传下去，逻辑在
+`app/config.py` 的 `codex_provider_overrides()`。
+
+密钥走 `env_key` + 子进程环境变量，**不进命令行参数** ——
+否则 `ps` 里同机用户能看到你的 API Key。
+
+如果不想动 `.env`，也可以直接写用户级 `~/.codex/config.toml`：
+
+```toml
+model_provider = "myrelay"
+
+[model_providers.myrelay]
+name = "My Relay"
+base_url = "https://your-endpoint.example.com/v1"
+wire_api = "responses"
+env_key = "MYRELAY_API_KEY"      # 这个环境变量必须存在于服务进程的环境里
+requires_openai_auth = false
+```
+
+> ⚠️ 项目级 `.codex/config.toml` 里写 `model_provider` / `model_providers`
+> 会被 Codex **忽略**，必须写在用户级 `~/.codex/config.toml`。
+> `openai` / `ollama` / `lmstudio` 是 CLI 的保留 provider id，不能用于自定义。
+
+### 5.5 建议保持默认的关键项
 
 | 变量 | 默认 | 为什么 |
 | --- | --- | --- |
@@ -286,7 +347,7 @@ cd /opt/rookie-agent
 .venv/bin/python deploy/probe_runtime_api.py             # 34/34
 
 # 离线测试套件
-.venv/bin/python scripts/smoke_test.py                   # 33/33
+.venv/bin/python scripts/smoke_test.py                   # 42/42
 .venv/bin/python scripts/smoke_exec.py                   # 65/65（需能 import openai_codex）
 
 # 路径锚定（模拟 systemd 的 CWD=/）
@@ -411,3 +472,4 @@ sudo systemctl start rookie-agent
 | `deploy/requirements.lock.txt` | 安装后自动生成的精确版本锁 |
 | `docs/linux-deployment-readiness.md` | 上线可行性评估（P0/P1/P2 清单） |
 | `scripts/probe_sandbox.py` | 沙箱能力探测（平台相关，必须在目标机跑） |
+| `scripts/probe_codex_endpoint.py` | 自定义 Codex 端点自检（验 Responses 协议 + SSE 流式） |

@@ -20,6 +20,7 @@
     ✅ 分身任务被调度、执行、产出结果
     ✅ cron 表达式能算出下次触发时刻
     ✅ 记忆写入失败时进入 outbox 且能补投
+    ✅ 自定义 Codex 端点被正确翻译成 CLI 配置（密钥只进环境变量）
 
 用法::
 
@@ -43,7 +44,14 @@ sys.path.insert(0, str(ROOT))
 from app.brain import CodexBrain  # noqa: E402
 from app.clones import CloneSystem, CronExpr  # noqa: E402
 from app.command_audit import CommandAuditor  # noqa: E402
-from app.config import AppConfig, load_config  # noqa: E402
+from app.config import (  # noqa: E402
+    CODEX_PROVIDER_KEY_ENV,
+    AppConfig,
+    CodexConfig,
+    codex_provider_overrides,
+    load_config,
+    validate_environment,
+)
 from app.contracts import (  # noqa: E402
     InboundMessage,
     MediaKind,
@@ -500,6 +508,90 @@ async def scenario_commands(orch: Orchestrator, channel: RecordingChannel) -> No
 
 
 # =========================================================================== #
+# 场景 7：自定义 Codex 端点
+# =========================================================================== #
+
+
+async def scenario_custom_endpoint(workdir: Path) -> None:
+    """自定义端点 → Codex CLI 配置的翻译逻辑必须能离线断言。
+
+    这条最容易静默出错：键名拼错一个字符，CLI 只会抛一句难懂的反序列化错误；
+    更糟的是配了不支持 Responses 协议的中转 —— 配置能通过、启动也正常，
+    只是每轮对话都超时。所以形状校验必须在启动前 fail-fast。
+    """
+    # 1) 留空 = 官方 provider，不该产生任何 CLI 覆盖项
+    overrides, env = codex_provider_overrides(CodexConfig())
+    check("未配 base_url 时不生成 CLI 覆盖项", overrides == () and env is None, repr(overrides))
+
+    # 2) 配了 base_url：切 provider + 锁 responses + 密钥走环境变量
+    custom = CodexConfig(
+        base_url="https://relay.example.com/v1",
+        base_url_api_key="sk-unit-test-key",
+        base_url_provider_id="myrelay",
+    )
+    overrides, env = codex_provider_overrides(custom)
+    check("覆盖项切到自定义 model_provider", 'model_provider="myrelay"' in overrides)
+    check(
+        "覆盖项写入 base_url",
+        'model_providers.myrelay.base_url="https://relay.example.com/v1"' in overrides,
+    )
+    check(
+        "覆盖项锁定 responses 协议",
+        'model_providers.myrelay.wire_api="responses"' in overrides,
+    )
+    check("覆盖项声明无需官方登录态", "requires_openai_auth=false" in " ".join(overrides))
+    check(
+        "密钥只进环境变量、不进命令行参数",
+        env is not None
+        and env.get(CODEX_PROVIDER_KEY_ENV) == "sk-unit-test-key"
+        and not any("sk-unit-test-key" in o for o in overrides),
+        "argv 里出现密钥会被同机用户从 ps 看到",
+    )
+
+    # 3) 没给专用 key 时应回落到 OPENAI_API_KEY
+    _, env2 = codex_provider_overrides(
+        CodexConfig(base_url="https://x.example.com/v1", api_key="sk-fallback")
+    )
+    check(
+        "专用 key 缺省时复用 OPENAI_API_KEY",
+        env2 is not None and env2.get(CODEX_PROVIDER_KEY_ENV) == "sk-fallback",
+    )
+
+    # 4) 保留 provider id 必须被启动前校验拦下（CLI 侧只会静默失败或报天书）
+    base = load_config(ROOT / ".env")
+    reserved = replace(
+        base,
+        data_dir=workdir,  # 让 validate_environment 的可写探测落在测试目录，别碰真实 var/
+        codex=replace(
+            base.codex,
+            base_url="https://x.example.com/v1",
+            base_url_provider_id="openai",
+        ),
+    )
+    problems, _ = validate_environment(reserved)
+    check(
+        "保留 provider id（openai）被拒绝启动",
+        any("保留" in p for p in problems),
+        str(problems)[:90],
+    )
+
+    # 5) URL 形状不对也要 fail-fast
+    bad_url = replace(
+        base,
+        data_dir=workdir,
+        codex=replace(
+            base.codex, base_url="relay.example.com/v1", base_url_provider_id="ok"
+        ),
+    )
+    problems2, _ = validate_environment(bad_url)
+    check(
+        "缺少 http(s):// 前缀的 base_url 被拒绝启动",
+        any("http://" in p or "https://" in p for p in problems2),
+        str(problems2)[:90],
+    )
+
+
+# =========================================================================== #
 # 主流程
 # =========================================================================== #
 
@@ -545,6 +637,7 @@ async def run() -> int:
         await scenario_memory(hub, orch)
         await scenario_clones(orch)
         await scenario_commands(orch, channel)
+        await scenario_custom_endpoint(workdir)
     finally:
         await orch.stop()
 

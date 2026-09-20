@@ -21,7 +21,7 @@
 >
 > **实测环境**：Ubuntu 26.04 LTS / Python 3.14.4 / N100 x86_64 / `/opt/rookie-agent`
 >
-> **全量验收结果**：`deploy/verify.sh` → **通过 25 / 失败 0**；`smoke_test 33/33`、
+> **全量验收结果**：`deploy/verify.sh` → **通过 25 / 失败 0**；`smoke_test 42/42`、
 > `smoke_exec 65/65`、运行时 API 探针 **34/34**、健康检查 **tool_count=49（2/2 server healthy）**。
 >
 > 📖 **部署与运行请直接看 [`docs/deployment-linux.md`](./deployment-linux.md)** —— 那是操作手册。
@@ -572,4 +572,47 @@ apt 包叫 `bubblewrap`，提供的二进制叫 **`bwrap`**。
 | §2.5 首次运行需联网下载嵌入模型（~80 MB） | 仍然成立。离线环境需预置缓存 |
 | §4.5 无备份 / 恢复 / 升级回滚流程 | 仍然成立。`deployment-linux.md` §8.3 给出了需备份的三条路径，但**没有自动化脚本** |
 | §1.1 无 CI | 仍然成立。Linux 侧回归目前靠 `deploy/verify.sh` 手工触发 |
+
+### 9.8 新增能力：自定义 Codex 端点（附一个必须知道的协议约束）
+
+原文把"模型凭据"简化为"填 API Key 或复用登录态"两种，**漏了第三种也是最常见的一种：
+指向自建/第三方端点**。现已支持，配置项：
+
+```bash
+AGENT_CODEX_BASE_URL=https://your-endpoint.example.com/v1
+AGENT_CODEX_BASE_URL_API_KEY=
+AGENT_CODEX_MODEL=<该端点认识的模型名>
+```
+
+**实现要点**（原评估没意识到 SDK 这一层的限制）：
+
+``openai_codex.CodexConfig`` 里**没有** ``base_url`` 字段 —— 端点属于 Codex CLI 的
+``model_providers`` 配置，不属于 SDK 的 Python 面。可行的通路是 SDK 的
+``config_overrides``：其中每个元素会被拼成 ``codex --config <key=value>`` 传给 CLI。
+已实现为 ``app/config.py`` 的纯函数 ``codex_provider_overrides()``，
+密钥走 ``env_key`` + 子进程环境变量，**不进命令行参数**（否则 ``ps`` 里同机用户可见）。
+
+> 🔴 **协议约束（实测，非文档推断）**：端点必须实现 OpenAI 的 **Responses API**
+> 并且**支持 SSE 流式**。Codex CLI 0.154.0 已把 Chat Completions 协议整个移除：
+>
+> | `wire_api` | 实测结果 |
+> | --- | --- |
+> | `"chat"` | `` `wire_api = "chat"` is no longer supported. How to fix: set `wire_api = "responses"` `` |
+> | `"chat_completions"` | `` unknown variant `chat_completions`, expected `responses` `` |
+> | `"responses"` / 缺省 | 实际请求 `{base_url}/responses`，请求头 `accept: text/event-stream` |
+>
+> 后果：**只提供 `/v1/chat/completions` 的第三方中转无法使用**，哪怕它自称
+> "OpenAI 兼容"。这类失败很隐蔽 —— 配置能通过、服务能起、provider 也切过去了，
+> 只是每轮对话都超时。
+>
+> 为此新增 `scripts/probe_codex_endpoint.py`：实际发一个最小 Responses 请求，
+> 按响应形态给诊断（404 = 没有 /responses 路径、Content-Type 非
+> `text/event-stream` = 不支持流式、401/403 = 密钥问题）。
+> **选端点前先跑它**，比配完再排查便宜得多。
+
+验证方式：`smoke_test.py` 新增 9 项断言（总计 **42/42**），覆盖
+"留空不产生覆盖项 / 切换 provider / 锁定 responses / 密钥不进 argv /
+专用 key 回落 OPENAI_API_KEY / 保留 provider id 被拒 / URL 形状被拒"。
+另外做过一次端到端实证：用本地 HTTP 服务器捕获 CLI 真实请求，
+确认打到 `/v1/responses` 且 `Authorization` 带上了注入的密钥。
 

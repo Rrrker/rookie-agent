@@ -6,7 +6,7 @@
 PAD 情绪 + 多模态路由 + MCP 工具挂载。
 
 六个模块彼此只依赖 `app/contracts.py`，实现类之间互不 import —— 任何一个模块都能被替换成
-Mock。两个离线测试正是靠这一点验证架构：**`smoke_test.py` 33/33**（架构层）、
+Mock。两个离线测试正是靠这一点验证架构：**`smoke_test.py` 42/42**（架构层）、
 **`smoke_exec.py` 65/65**（执行层），全程不需要 MemPalace、Telegram 或 Codex 账号。
 
 ---
@@ -19,7 +19,7 @@ cd rookie-agent
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # ① 离线验证：不装任何外部依赖也能跑通全链路（用桩替换工具/渠道/模型）
-python scripts/smoke_test.py    # 架构层 33/33
+python scripts/smoke_test.py    # 架构层 42/42
 python scripts/smoke_exec.py    # 执行层 65/65
 
 # ② 把识图/STT/TTS/记忆 四个 MCP server 挂载进 Codex（只追加，不重写你的配置）
@@ -508,6 +508,36 @@ with Codex() as codex:
     # 或 device-code / API Key
 ```
 
+### 7.7 自定义 Codex 端点
+
+想指向自建网关 / 公司中转 / 本地推理服务，在 `.env` 里填三项即可：
+
+```bash
+AGENT_CODEX_BASE_URL=https://your-endpoint.example.com/v1
+AGENT_CODEX_BASE_URL_API_KEY=...        # 留空则复用 OPENAI_API_KEY
+AGENT_CODEX_MODEL=<该端点认识的模型名>
+```
+
+> 🔴 **端点必须实现 OpenAI Responses API 且支持 SSE 流式。**
+> 请求打到 `{base_url}/responses`，请求头带 `accept: text/event-stream`。
+>
+> Codex CLI 0.154.0 已经把 **Chat Completions 协议整个移除**（实测）：
+> `wire_api="chat"` → `is no longer supported`；
+> `wire_api="chat_completions"` → `unknown variant, expected 'responses'`。
+>
+> 所以**只提供 `/v1/chat/completions` 的第三方中转配了也用不了** ——
+> 配置能过、服务能起，只是每轮对话都失败。选端点前先跑：
+>
+> ```bash
+> python scripts/probe_codex_endpoint.py --show-events
+> ```
+
+实现细节：SDK 的 `CodexConfig` 里**没有** `base_url` 字段，端点属于 Codex CLI 的
+`model_providers` 配置，本项目通过 SDK 的 `config_overrides`
+（拼成 `codex --config k=v`）传下去 —— 见 `app/config.py` 的
+`codex_provider_overrides()`。密钥走子进程环境变量而非命令行参数，
+避免出现在 `ps` 输出里。
+
 ---
 
 ## 8. 验证结果
@@ -515,7 +545,7 @@ with Codex() as codex:
 `python scripts/smoke_test.py` —— 用桩替换工具层、渠道层与模型，验证架构与流程本身：
 
 ```
-通过 33/33
+通过 42/42
 
 场景 1｜对话流水线（情绪 + 记忆 + 主脑）
   输入            P       A       D      象限
@@ -530,6 +560,7 @@ with Codex() as codex:
 场景 4｜记忆层    语义召回 ✅  MCP 通道 ✅  KG 降级不抛异常 ✅  outbox 自愈 ✅
 场景 5｜分身      3/3 任务完成 ✅  worker 池 ✅  cron 解析 ✅  非法表达式拒绝 ✅
 场景 6｜指令集    /help /emotion /memory /status /task 全部有响应 ✅
+场景 7｜自定义端点 base_url→CLI 覆盖项 ✅  锁 responses 协议 ✅  密钥不进 argv ✅  保留 id 被拒 ✅
 ```
 
 ---
@@ -559,7 +590,8 @@ rookie-agent/
 ├── scripts/
 │   ├── setup_codex_mcp.py           # 把工具挂载进 ~/.codex/config.toml
 │   ├── probe_sandbox.py             # 沙箱边界探测（不需要 Codex 账号）
-│   ├── smoke_test.py                # 架构冒烟测试（33 项）
+│   ├── probe_codex_endpoint.py      # 自定义 Codex 端点自检（Responses + SSE）
+│   ├── smoke_test.py                # 架构冒烟测试（42 项）
 │   └── smoke_exec.py                # 执行层专项测试（65 项）
 ├── deploy/                          # Linux 部署套件（无容器化）
 │   ├── install.sh                   # 一键引导：apt 依赖 → venv → 目录 → .env → unit
@@ -669,6 +701,6 @@ Codex 只有一次性命令，没有 Hermes 的 `process`（start/logs/kill）�
 ### 11.5 验证
 
 ```bash
-python scripts/smoke_test.py    # 架构层 33/33
+python scripts/smoke_test.py    # 架构层 42/42
 python scripts/smoke_exec.py    # 执行层 65/65（含真实进程 start/logs/stop 全链路）
 ```

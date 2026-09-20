@@ -130,6 +130,30 @@ class CodexConfig:
     # 开发模式：不真正调用 Codex，用确定性桩函数回包（smoke_test --dry-run 用）
     dry_run: bool = False
 
+    # ------------------------------------------------------------------ #
+    # 自定义模型端点
+    # ------------------------------------------------------------------ #
+    # 留空 = 用 Codex 内置的 openai provider（官方端点或 ~/.codex 里的登录态）。
+    #
+    # ⚠️ 填了之后，**端点必须实现 OpenAI 的 Responses API**，
+    #    请求会打到 ``{base_url}/responses``。这一点没有商量余地：
+    #    Codex CLI 0.154.0 已经把 Chat Completions 协议整个移除了 ——
+    #    实测 ``wire_api="chat"`` 会报错 "is no longer supported"，
+    #    ``wire_api="chat_completions"`` 会报 unknown variant（只认 responses）。
+    #    所以只提供 ``/v1/chat/completions`` 的第三方中转**配了也用不了**。
+    #
+    # 为什么不在 SDK 层配：``openai_codex.CodexConfig`` 里**没有** base_url 字段。
+    # 端点属于 Codex CLI 的 model_providers 配置，我们通过 SDK 的
+    # ``config_overrides``（会被拼成 ``codex --config k=v``）传下去 ——
+    # 见 ``CodexBrain._sdk_config()``。
+    base_url: str | None = None
+    # 该端点用的 API Key。留空则复用 ``api_key``（即 OPENAI_API_KEY）。
+    # 实现上走子进程环境变量，不进命令行 —— 避免密钥出现在 ps 输出里。
+    base_url_api_key: str | None = None
+    # 自定义 provider 的 id。留空用 "rookie"。
+    # ⚠️ 不能填 openai / ollama / lmstudio —— 这三个是 CLI 的保留 id。
+    base_url_provider_id: str = "rookie"
+
 
 @dataclass(frozen=True, slots=True)
 class TelegramConfig:
@@ -325,6 +349,10 @@ def load_config(env_file: Path | str = ".env") -> AppConfig:
         approval_mode=env("AGENT_CODEX_APPROVAL_MODE", "deny_all") or "deny_all",
         turn_timeout_sec=env_float("AGENT_TURN_TIMEOUT_SEC", 180.0),
         dry_run=env_bool("AGENT_DRY_RUN", False),
+        # 自定义端点：留空即用官方 openai provider
+        base_url=env("AGENT_CODEX_BASE_URL"),
+        base_url_api_key=env("AGENT_CODEX_BASE_URL_API_KEY"),
+        base_url_provider_id=env("AGENT_CODEX_PROVIDER_ID", "rookie") or "rookie",
     )
 
     telegram = TelegramConfig(
@@ -459,6 +487,56 @@ def validate_security(cfg: AppConfig) -> tuple[list[str], list[str]]:
     return problems, notices
 
 
+# 传给 Codex CLI 子进程、用来承载自定义端点密钥的环境变量名。
+# 必须与 codex_provider_overrides() 生成的 env_key 值保持一致。
+CODEX_PROVIDER_KEY_ENV = "ROOKIE_AGENT_CODEX_KEY"
+
+
+def codex_provider_overrides(
+    cfg: CodexConfig,
+) -> tuple[tuple[str, ...], dict[str, str] | None]:
+    """把自定义端点配置翻译成 Codex CLI 的 ``--config`` 覆盖项与子进程环境变量。
+
+    为什么不在 SDK 层做：``openai_codex.CodexConfig`` 里**没有** ``base_url``
+    字段 —— 端点属于 Codex CLI 的 ``model_providers`` 配置，不属于 SDK 的
+    Python 面。但 SDK 提供了 ``config_overrides``，它的每个元素会被拼成
+    ``codex --config <key=value>``（点号路径可覆盖嵌套键），于是能从这里配下去。
+
+    两个刻意的选择：
+
+    * 密钥走 ``env_key`` + ``env``，不用 ``experimental_bearer_token`` ——
+      后者会把密钥写进命令行参数，``ps`` 里同机用户可见。
+    * 显式写 ``wire_api="responses"``，尽管它当前就是默认值。Codex CLI 0.154.0
+      已把 Chat Completions 协议整个移除（实测 ``chat`` 报
+      "is no longer supported"），写死能让"将来默认值变了"变成显式错误，
+      而不是一路静默走到请求失败。
+
+    抽成纯函数（不 import SDK）是为了让离线架构测试能直接断言输出，
+    不必先把 openai-codex 装进测试环境。
+
+    Args:
+        cfg: 主脑配置。``base_url`` 为空时返回空覆盖项（即用官方 provider）。
+
+    Returns:
+        ``(config_overrides, env)``。``env`` 为 ``None`` 表示无需额外注入密钥。
+    """
+    if not cfg.base_url:
+        return (), None
+
+    pid = cfg.base_url_provider_id
+    overrides = (
+        f'model_provider="{pid}"',
+        f'model_providers.{pid}.name="rookie-agent custom endpoint"',
+        f'model_providers.{pid}.base_url="{cfg.base_url}"',
+        f'model_providers.{pid}.wire_api="responses"',
+        f'model_providers.{pid}.env_key="{CODEX_PROVIDER_KEY_ENV}"',
+        f'model_providers.{pid}.requires_openai_auth=false',
+    )
+    key = cfg.base_url_api_key or cfg.api_key
+    env = {CODEX_PROVIDER_KEY_ENV: key} if key else None
+    return overrides, env
+
+
 def _executable_exists(cmd: str) -> bool:
     """判断 MCP 启动命令是否可用：绝对/带分隔符的查文件，裸名字查 PATH。"""
     if not cmd:
@@ -531,6 +609,40 @@ def validate_environment(cfg: AppConfig) -> tuple[list[str], list[str]]:
         notices.append(
             "AGENT_PROCESS_ENABLED=true 但当前不是 Linux："
             "长驻进程不受任何沙箱约束，请确保运行在专用账号下。"
+        )
+
+    # 7) 自定义 Codex 端点 —— 配错的后果是"启动正常、每轮对话超时"，
+    #    所以形状问题一律 fail-fast，不留到运行期。
+    if cfg.codex.base_url:
+        url = cfg.codex.base_url
+        if not url.startswith(("http://", "https://")):
+            problems.append(
+                f"AGENT_CODEX_BASE_URL 必须以 http:// 或 https:// 开头，当前是 {url!r}。"
+            )
+        # 端点值会被包进 TOML 基本字符串再交给 CLI 的 --config 解析。
+        # 出现引号或反斜杠会让它变成非法 TOML，报错信息很难懂，所以提前拦。
+        if any(ch in url for ch in ('"', "\\")):
+            problems.append(
+                f"AGENT_CODEX_BASE_URL 不能包含引号或反斜杠，当前是 {url!r}。"
+            )
+        # CLI 的保留 provider id，自定义会失败（或被忽略，更难查）
+        reserved = {"openai", "ollama", "lmstudio"}
+        if cfg.codex.base_url_provider_id in reserved:
+            problems.append(
+                f"AGENT_CODEX_PROVIDER_ID={cfg.codex.base_url_provider_id!r} 是 Codex CLI 的保留 id"
+                f"（{'/'.join(sorted(reserved))}），不能用于自定义端点。换一个名字，例如 rookie。"
+            )
+        if not (cfg.codex.base_url_api_key or cfg.codex.api_key):
+            notices.append(
+                f"已配置自定义端点 {url}，但没提供 API Key"
+                "（AGENT_CODEX_BASE_URL_API_KEY 与 OPENAI_API_KEY 都为空）。"
+                "本地推理服务不需要 Key 时这是正常的；否则请求会 401。"
+            )
+        notices.append(
+            f"Codex 主脑将使用自定义端点：{url}"
+            f"（provider={cfg.codex.base_url_provider_id}，请求 {url.rstrip('/')}/responses）。"
+            "注意：Codex CLI 0.154.0 只支持 Responses 协议，"
+            "仅提供 /v1/chat/completions 的第三方中转无法使用。"
         )
 
     return problems, notices

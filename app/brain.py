@@ -58,7 +58,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from app.command_audit import extract_commands, extract_file_changes
-from app.config import CodexConfig, project_root
+from app.config import CodexConfig, codex_provider_overrides, project_root
 from app.contracts import CloneSpec, CommandTrace, Entity, ExtractionResult, Triple, ToolPort
 
 logger = logging.getLogger(__name__)
@@ -260,15 +260,28 @@ class CodexBrain:
             raise RuntimeError(f"openai-codex 不可用: {_SDK_IMPORT_ERROR}")
 
         self._stack = contextlib.AsyncExitStack()
-        self._codex = await self._stack.enter_async_context(AsyncCodex())
-        if self.cfg.api_key:
+        self._codex = await self._stack.enter_async_context(AsyncCodex(self._sdk_config()))
+
+        if self.cfg.base_url:
+            # 自定义 provider 自带凭据（env_key → 子进程环境变量），不需要、
+            # 也不应该再往 ~/.codex 写一份内置 openai provider 的登录态。
+            logger.info(
+                "Codex 主脑使用自定义端点：%s（provider=%s）",
+                self.cfg.base_url,
+                self.cfg.base_url_provider_id,
+            )
+        elif self.cfg.api_key:
             try:
                 await self._codex.login_api_key(self.cfg.api_key)
                 logger.info("已使用 API Key 登录 Codex")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("API Key 登录失败，将尝试复用已有登录态: %s", exc)
-        account = await self._codex.account()
-        logger.info("Codex 主脑就绪，账号=%s", getattr(account, "account", "unknown"))
+        try:
+            account = await self._codex.account()
+            logger.info("Codex 主脑就绪，账号=%s", getattr(account, "account", "unknown"))
+        except Exception as exc:  # noqa: BLE001
+            # 走自定义端点时机器上本来就没有官方账号，这不该让启动失败。
+            logger.info("Codex 主脑就绪（未取到官方账号信息：%s）", exc)
 
     async def close(self) -> None:
         self._threads.clear()
@@ -281,6 +294,19 @@ class CodexBrain:
         if session_id not in self._locks:
             self._locks[session_id] = asyncio.Lock()
         return self._locks[session_id]
+
+    def _sdk_config(self) -> Any:
+        """把我们的 :class:`app.config.CodexConfig` 翻译成 SDK 的 ``CodexConfig``。
+
+        翻译规则（包括为什么自定义端点必须走 CLI 的 ``model_providers``、
+        为什么密钥用环境变量而不是命令行参数）见
+        :func:`app.config.codex_provider_overrides` —— 那边是纯函数，
+        这里只负责把它塞进 SDK 的数据结构。
+        """
+        from openai_codex import CodexConfig as SdkCodexConfig
+
+        overrides, env = codex_provider_overrides(self.cfg)
+        return SdkCodexConfig(config_overrides=overrides, env=env)
 
     def _sandbox(self) -> Any:
         """把配置里的字符串安全地映射到 SDK 的 Sandbox 预设。"""
